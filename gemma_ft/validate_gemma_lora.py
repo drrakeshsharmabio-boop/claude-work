@@ -172,10 +172,13 @@ def score_graph(graph, page_text):
 def compare_to_truth(graph, truth):
     """Exact-match P/R/F1 on entity names and on (source, type, target) triples."""
     def prf(pred, gold):
+        if not pred and not gold:
+            return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "n_pred": 0, "n_gold": 0}
         tp = len(pred & gold)
         p = tp / len(pred) if pred else 0.0
         r = tp / len(gold) if gold else 0.0
-        return {"precision": p, "recall": r, "f1": (2 * p * r / (p + r)) if (p + r) else 0.0}
+        return {"precision": p, "recall": r, "f1": (2 * p * r / (p + r)) if (p + r) else 0.0,
+                "n_pred": len(pred), "n_gold": len(gold)}
 
     pe = {e.get("name") for e in graph.get("entities", []) if isinstance(e, dict)}
     ge = {e.get("name") for e in truth.get("entities", []) if isinstance(e, dict)}
@@ -207,8 +210,13 @@ def sample_train_rows(path, n, seed):
 
 
 def page_text_from_prompt(prompt):
-    m = re.search(r"=====PAGE TEXT=====\s*(.*?)\s*=====END PAGE TEXT=====", prompt, re.S)
-    return m.group(1) if m else prompt
+    # The instructions also mention "=====PAGE TEXT=====" ("...given below under =====PAGE TEXT=====."),
+    # so take the LAST marker that starts a line, not the first occurrence.
+    start = prompt.rfind("=====PAGE TEXT=====\n")
+    end = prompt.rfind("\n=====END PAGE TEXT=====")
+    if start == -1 or end == -1 or end < start:
+        return prompt
+    return prompt[start + len("=====PAGE TEXT=====\n"): end]
 
 
 def resolve_prompt_style(args):
@@ -253,7 +261,10 @@ def build_cases(args):
                     except ValueError:
                         pass
         random.Random(args.seed).shuffle(rows)
-        print("Using %d of %d pages from %s (UNSEEN pages, no ground truth)." % (min(args.n, len(rows)), len(rows), files[0]))
+        total = len(rows)
+        rows = [r for r in rows if len(page_text_from_prompt(r["prompt"]).strip()) >= args.min_chars]
+        print("Using %d of %d pages from %s (UNSEEN pages with >= %d chars of text, no ground truth)."
+              % (min(args.n, len(rows)), total, files[0], args.min_chars))
         for r in rows[: args.n]:
             page_text = page_text_from_prompt(r["prompt"])
             prompt = r["prompt"] if args.prompt == "v2" else TRAIN_PROMPT.format(page_text=page_text)
@@ -320,6 +331,7 @@ def main():
     ap.add_argument("--dataset", default="/content/drive/MyDrive/gemma_ft/gemma_training_dataset.jsonl.gz")
     ap.add_argument("--chunks", default="/content/drive/MyDrive/gemma_ft/other_resources_in")
     ap.add_argument("--n", type=int, default=20)
+    ap.add_argument("--min-chars", type=int, default=800, help="--data chunk: skip near-empty pages")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--max-new", type=int, default=4096)
     ap.add_argument("--max-seq", type=int, default=8192)
@@ -384,9 +396,10 @@ def main():
     print("positional names=%d  romanized name_hi=%d  bad fbsfm_class=%d" % (pos, rom, badc))
     if truth:
         for key in ("entities", "relationships"):
-            print("vs ground truth %-13s P=%.2f R=%.2f F1=%.2f" % (
+            print("vs ground truth %-13s P=%.2f R=%.2f F1=%.2f   (avg predicted %.1f vs gold %.1f per page)" % (
                 key, mean([t[key]["precision"] for t in truth]), mean([t[key]["recall"] for t in truth]),
-                mean([t[key]["f1"] for t in truth])))
+                mean([t[key]["f1"] for t in truth]), mean([t[key]["n_pred"] for t in truth]),
+                mean([t[key]["n_gold"] for t in truth])))
 
     # Heuristic gates - tune to taste.
     gates = [("valid-or-salvaged JSON >= 95%", n and (ok + salv) / n >= 0.95),

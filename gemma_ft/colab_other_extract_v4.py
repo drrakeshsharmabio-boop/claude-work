@@ -120,8 +120,11 @@ def resolve_prompt_style():
 
 def build_chat_prompt(tok, row, style):
     if style == "v1":
-        m = re.search(r"=====PAGE TEXT=====\s*(.*?)\s*=====END PAGE TEXT=====", row["prompt"], re.S)
-        content = V1_PROMPT.format(page_text=m.group(1) if m else row["prompt"])
+        # take the LAST "=====PAGE TEXT=====" line: the instructions mention the marker too
+        p = row["prompt"]
+        start, end = p.rfind("=====PAGE TEXT=====\n"), p.rfind("\n=====END PAGE TEXT=====")
+        page_text = p[start + len("=====PAGE TEXT=====\n"): end] if -1 < start < end else p
+        content = V1_PROMPT.format(page_text=page_text)
     else:
         content = row["prompt"]
     text = tok.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=False)
