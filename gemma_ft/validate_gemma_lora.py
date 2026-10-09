@@ -7,14 +7,24 @@ no other model is holding GPU memory:
     !pip install --no-deps xformers trl peft accelerate bitsandbytes
     from google.colab import drive; drive.mount("/content/drive")
 
-    # A) training-format check on samples from the training file (ground truth available)
-    !python /content/drive/MyDrive/gemma_ft/validate_gemma_lora.py --mode train --n 20
+    # A) pages from the training file (ground truth available -> P/R/F1)
+    !python /content/drive/MyDrive/gemma_ft/validate_gemma_lora.py --data train --n 20
 
-    # B) production-format check on UNSEEN pages (uses the `prompt` field of a chunk file,
-    #    exactly like colab_other_extract.py; no ground truth, so grounding checks only)
-    !python /content/drive/MyDrive/gemma_ft/validate_gemma_lora.py --mode chunk --n 20
+    # B) UNSEEN pages from other_resources_in (no ground truth -> grounding checks only)
+    !python /content/drive/MyDrive/gemma_ft/validate_gemma_lora.py --data chunk --n 20
+
+Prompt style (--prompt, default auto = read <adapter>/prompt_style.txt, else v1):
+  v1  the format the FIRST adapter (gemma_fbsfm_lora) was trained on: short "Below is an OCR
+      page..." prompt, generation prompt WITHOUT Gemma 4's `<|channel>thought\n<channel|>`
+      suffix, reply starts with "### Extracted JSON:".
+  v2  the format of gemma_training_v2_promptfix.ipynb: the full production Ed-Machine prompt
+      and the chat template's own generation prompt (with the thought-channel suffix), reply is
+      bare JSON. With --data train, v2 needs rows that carry a `prompt` field (the held-out
+      file written by the v2 notebook does).
 
 What it fixes compared to the notebook cells:
+  * prompts the model in the SAME format it was trained on (see --prompt);
+  * stops on `<turn|>` as well as <eos>;
   * loads the adapter with text_only=True (without it every LoRA key is "missing" and the
     adapter is silently NOT applied);
   * strips Gemma 4's empty thinking block `<|channel>thought\\n<channel|>` before parsing;
@@ -24,8 +34,9 @@ What it fixes compared to the notebook cells:
   * scores the output: schema, dangling relationship endpoints, positional names, Romanized
     name_hi, entities that are not grounded in the page text, and P/R/F1 vs ground truth.
 
-NOTE: the training file has no held-out split, so --mode train samples are TRAINING rows. It
-tells you whether the format was learned, not whether it generalises. Use --mode chunk for that.
+NOTE: the original training file has no held-out split, so --data train on it samples TRAINING
+rows: it tells you whether the format was learned, not whether it generalises. Use --data chunk,
+or the held-out file written by the v2 notebook, for that.
 """
 import argparse
 import glob
@@ -39,9 +50,10 @@ import time
 VALID_CLASSES = {"S", "B", "F", "P", "C", "M"}
 BAD_PREFIXES = ("FIRST_", "SECOND_", "THIRD_", "THIS_", "THAT_", "TARGET_", "R1_", "R2_")
 SNAKE_RE = re.compile(r"^[A-Z0-9]+(?:_[A-Z0-9]+)*$")
-DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 STOP = {"with", "from", "type", "that", "this", "into", "their", "page", "figure", "table"}
 CLEAN_TOKENS = ("<turn|>", "<|turn>", "<eos>", "<pad>", "<bos>", "<end_of_turn>")
+THOUGHT_SUFFIX = "<|channel>thought\n<channel|>"  # Gemma 4 template adds this when thinking is off
 
 # The exact user prompt used during training (see the training cell of the notebook).
 TRAIN_PROMPT = (
@@ -107,7 +119,7 @@ def _stems(s):
 
 
 def is_english_page(page_text):
-    letters = re.findall(r"[A-Za-zऀ-ॿ]", page_text)
+    letters = re.findall(r"[A-Za-z\u0900-\u097F]", page_text)
     if not letters:
         return False
     ascii_letters = sum(1 for ch in letters if ch.isascii())
@@ -199,18 +211,35 @@ def page_text_from_prompt(prompt):
     return m.group(1) if m else prompt
 
 
+def resolve_prompt_style(args):
+    if args.prompt != "auto":
+        return args.prompt
+    marker = os.path.join(args.adapter, "prompt_style.txt")
+    if os.path.isfile(marker):
+        with open(marker, encoding="utf-8") as f:
+            return f.read().strip() or "v1"
+    return "v1"
+
+
 def build_cases(args):
     cases = []
-    if args.mode == "train":
+    if args.data == "train":
         rows, total = sample_train_rows(args.dataset, args.n, args.seed)
-        print("Sampled %d of %d training rows (these were TRAINED ON)." % (len(rows), total))
+        print("Sampled %d of %d rows from %s." % (len(rows), total, args.dataset))
         for r in rows:
             try:
                 truth = json.loads(r["extracted_graph"])
             except Exception:
                 truth = None
+            if args.prompt == "v2":
+                if "prompt" not in r:
+                    raise SystemExit("--prompt v2 with --data train needs rows with a `prompt` field; use the "
+                                     "held-out file written by the v2 notebook as --dataset.")
+                prompt = r["prompt"]
+            else:
+                prompt = TRAIN_PROMPT.format(page_text=r["raw_ocr_text"])
             cases.append({"id": str(r.get("page", "?")), "page_text": r["raw_ocr_text"],
-                          "prompt": TRAIN_PROMPT.format(page_text=r["raw_ocr_text"]), "truth": truth})
+                          "prompt": prompt, "truth": truth})
     else:
         files = sorted(glob.glob(os.path.join(args.chunks, "other_resources_chunk_*.jsonl.gz")))
         if not files:
@@ -226,8 +255,10 @@ def build_cases(args):
         random.Random(args.seed).shuffle(rows)
         print("Using %d of %d pages from %s (UNSEEN pages, no ground truth)." % (min(args.n, len(rows)), len(rows), files[0]))
         for r in rows[: args.n]:
+            page_text = page_text_from_prompt(r["prompt"])
+            prompt = r["prompt"] if args.prompt == "v2" else TRAIN_PROMPT.format(page_text=page_text)
             cases.append({"id": "%s p%s" % (r.get("pdf_name", "?"), r.get("page", "?")),
-                          "page_text": page_text_from_prompt(r["prompt"]), "prompt": r["prompt"], "truth": None})
+                          "page_text": page_text, "prompt": prompt, "truth": None})
     return cases
 
 
@@ -249,14 +280,29 @@ def load_model(args):
     return model, tok
 
 
+def chat_prompt(tok, prompt, style):
+    text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+    if style == "v1" and text.endswith(THOUGHT_SUFFIX):
+        text = text[: -len(THOUGHT_SUFFIX)]  # v1 was trained on "<|turn>model\n" + reply, no thought channel
+    return text
+
+
+def stop_ids(tok):
+    ids = [tok.eos_token_id]
+    turn_end = tok.convert_tokens_to_ids("<turn|>")
+    if isinstance(turn_end, int) and turn_end != tok.unk_token_id:
+        ids.append(turn_end)
+    return [i for i in ids if i is not None]
+
+
 def generate(model, tok, prompts, args):
     import torch
-    chat = [tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
-            for p in prompts]
+    chat = [chat_prompt(tok, p, args.prompt) for p in prompts]
     enc = tok(chat, return_tensors="pt", padding=True, add_special_tokens=False).to("cuda")
     with torch.no_grad():
         out = model.generate(**enc, max_new_tokens=args.max_new, do_sample=False, use_cache=True,
-                             repetition_penalty=args.rep_penalty, pad_token_id=tok.pad_token_id)
+                             repetition_penalty=args.rep_penalty, pad_token_id=tok.pad_token_id,
+                             eos_token_id=stop_ids(tok))
     res = []
     for j in range(len(prompts)):
         gen = out[j][enc["input_ids"].shape[1]:]
@@ -268,7 +314,8 @@ def generate(model, tok, prompts, args):
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["train", "chunk"], default="train")
+    ap.add_argument("--data", choices=["train", "chunk"], default="train")
+    ap.add_argument("--prompt", choices=["auto", "v1", "v2"], default="auto")
     ap.add_argument("--adapter", default="/content/drive/MyDrive/gemma_ft/gemma_fbsfm_lora")
     ap.add_argument("--dataset", default="/content/drive/MyDrive/gemma_ft/gemma_training_dataset.jsonl.gz")
     ap.add_argument("--chunks", default="/content/drive/MyDrive/gemma_ft/other_resources_in")
@@ -280,6 +327,8 @@ def main():
     ap.add_argument("--seed", type=int, default=3407)
     ap.add_argument("--report", default="/content/drive/MyDrive/gemma_ft/validation_report.json")
     args = ap.parse_args()
+    args.prompt = resolve_prompt_style(args)
+    print("Prompt style: %s" % args.prompt)
 
     cases = build_cases(args)
     model, tok = load_model(args)
@@ -325,7 +374,7 @@ def main():
     badc = sum(len(s["issues"]["bad_class"]) for s in scored)
     truth = [r["vs_truth"] for r in results if "vs_truth" in r]
 
-    print("\n================ SUMMARY (%d pages, mode=%s) ================" % (n, args.mode))
+    print("\n================ SUMMARY (%d pages, data=%s, prompt=%s) ================" % (n, args.data, args.prompt))
     print("valid JSON        : %d ok, %d salvaged (truncated), %d failed" % (ok, salv, fail))
     print("hit max_new_tokens: %d / %d" % (trunc, n))
     print("avg entities/page : %.1f   avg relationships/page: %.1f" % (

@@ -1,4 +1,4 @@
-"""colab_other_extract.py - Colab GPU extractor for OTHER RESOURCES using fine-tuned Gemma LoRA.
+"""colab_other_extract_v4.py - Colab GPU extractor for OTHER RESOURCES using fine-tuned Gemma LoRA.
 
 v4 changes vs v3:
   * loads the 31B 4-bit base + adapter through Unsloth with text_only=True (the adapter was
@@ -10,12 +10,19 @@ v4 changes vs v3:
   * resume check now looks where pages are actually written (v3 looked one level up, so
     nothing was ever skipped and every restart redid all pages).
   * default repetition penalty 1.05 (1.12-1.2 damages JSON).
+  * prompts in the format the adapter was trained on (--prompt-style, default auto = read
+    <adapter>/prompt_style.txt, else v1):
+      v1 = first adapter: short "Below is an OCR page..." prompt built from the page text,
+           generation prompt without Gemma 4's thought-channel suffix;
+      v2 = adapter from gemma_training_v2_promptfix.ipynb: the row's full production `prompt`
+           and the chat template's own generation prompt.
+  * stops on `<turn|>` as well as <eos>.
 
 Run in a fresh runtime so no other model is holding GPU memory:
-  python colab_other_extract.py --input /content/drive/MyDrive/gemma_ft/other_resources_in \
-                                --adapter /content/drive/MyDrive/gemma_ft/gemma_fbsfm_lora \
-                                --out /content/drive/MyDrive/gemma_ft/other_resources_out \
-                                --batch 4
+  python colab_other_extract_v4.py --input /content/drive/MyDrive/gemma_ft/other_resources_in \
+                                   --adapter /content/drive/MyDrive/gemma_ft/gemma_fbsfm_lora \
+                                   --out /content/drive/MyDrive/gemma_ft/other_resources_out \
+                                   --batch 4
 """
 import os
 import sys
@@ -35,9 +42,10 @@ ap.add_argument("--backend", choices=["unsloth", "hf"], default="unsloth")
 ap.add_argument("--model", default="google/gemma-4-E4B-it", help="base model, only used with --backend hf")
 ap.add_argument("--model-tag", default="gemma-4-31B-it-lora")
 ap.add_argument("--max-seq", type=int, default=8192)
+ap.add_argument("--prompt-style", choices=["auto", "v1", "v2"], default="auto")
 ap.add_argument("--retry-truncated", action="store_true", help="re-run pages previously saved as _truncated")
 ap.add_argument("--out", default="/content/drive/MyDrive/gemma_ft/other_resources_out")
-ap.add_argument("--batch", type=int, default=8)
+ap.add_argument("--batch", type=int, default=4)
 ap.add_argument("--max-new", type=int, default=12000)
 ap.add_argument("--rep-penalty", type=float, default=1.05)
 args = ap.parse_args()
@@ -94,6 +102,33 @@ PASSIVE = {
     "UPREGULATED_BY": "UPREGULATES",
     "DOWNREGULATED_BY": "DOWNREGULATES",
 }
+
+V1_PROMPT = ("Below is an OCR page from a biology textbook. Extract the knowledge graph in JSON format."
+             "\n\n### Page Text:\n{page_text}")
+THOUGHT_SUFFIX = "<|channel>thought\n<channel|>"
+
+
+def resolve_prompt_style():
+    if args.prompt_style != "auto":
+        return args.prompt_style
+    marker = os.path.join(args.adapter, "prompt_style.txt")
+    if os.path.isfile(marker):
+        with open(marker, encoding="utf-8") as f:
+            return f.read().strip() or "v1"
+    return "v1"
+
+
+def build_chat_prompt(tok, row, style):
+    if style == "v1":
+        m = re.search(r"=====PAGE TEXT=====\s*(.*?)\s*=====END PAGE TEXT=====", row["prompt"], re.S)
+        content = V1_PROMPT.format(page_text=m.group(1) if m else row["prompt"])
+    else:
+        content = row["prompt"]
+    text = tok.apply_chat_template([{"role": "user", "content": content}], add_generation_prompt=True, tokenize=False)
+    if style == "v1" and text.endswith(THOUGHT_SUFFIX):
+        text = text[: -len(THOUGHT_SUFFIX)]
+    return text
+
 
 def canon_rel(src, tgt, rtype):
     raw = (rtype or "RELATED_TO").strip()
@@ -193,6 +228,12 @@ def main():
     tok.padding_side = "left"
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
+    stop_ids = [tok.eos_token_id]
+    turn_end = tok.convert_tokens_to_ids("<turn|>")
+    if isinstance(turn_end, int) and turn_end != tok.unk_token_id:
+        stop_ids.append(turn_end)
+    style = resolve_prompt_style()
+    print(f"Prompt style: {style}")
     print("Model ready for high-throughput batch extraction!\n")
 
     input_files = sorted(glob.glob(os.path.join(args.input, "other_resources_chunk_*.jsonl.gz")))
@@ -243,10 +284,7 @@ def main():
             continue
 
         # Sort by prompt length to optimize batch padding efficiency
-        chat_prompts = [
-            tok.apply_chat_template([{"role": "user", "content": r["prompt"]}], add_generation_prompt=True, tokenize=False)
-            for r in todo
-        ]
+        chat_prompts = [build_chat_prompt(tok, r, style) for r in todo]
         order = sorted(range(len(todo)), key=lambda i: len(chat_prompts[i]))
 
         for k in range(0, len(order), args.batch):
@@ -265,6 +303,7 @@ def main():
                     repetition_penalty=args.rep_penalty,
                     use_cache=True,
                     pad_token_id=tok.pad_token_id,
+                    eos_token_id=stop_ids,
                 )
             dt = time.time() - t0
             total_time += dt
