@@ -17,8 +17,18 @@ CONFIGS = [
     ("D  v1-adapter | full  | ON ",   True,    "full",  True),
 ]
 
-sys.path.insert(0, ROOT)
+# mount Drive (no-op if already mounted) and load the validator from a local copy
+from google.colab import drive
+drive.mount("/content/drive")
+import os, shutil, importlib
+src = f"{ROOT}/validate_gemma_lora.py"
+if not os.path.exists(src):
+    raise SystemExit(f"Not found: {src}\nFiles in gemma_ft: {sorted(os.listdir(ROOT))}")
+shutil.copy(src, "/content/validate_gemma_lora.py")
+sys.path.insert(0, "/content")
 import validate_gemma_lora as V
+importlib.reload(V)   # make sure the fixed version is the one in use
+print("validator loaded, page-text fix present:", "rfind" in open(src).read())
 
 # ---- 1. five unseen English pages with real content
 chunk = sorted(glob.glob(f"{ROOT}/other_resources_in/other_resources_chunk_*.jsonl.gz"))[0]
