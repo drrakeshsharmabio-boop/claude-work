@@ -112,6 +112,46 @@ def build_clusters(keys, gap, block):
     return clusters
 
 
+def choose_split(keys, val_frac=0.10, gap=1, block=20, seed=3407, holdout_docs=()):
+    """keys: list of (document, page, row_index). Returns (val_idx, buffer_idx, info).
+
+    val_idx    row indices for validation (whole clusters, plus any held-out documents)
+    buffer_idx training-side rows within `gap` pages of a validation page: do NOT train on them
+    Importable from notebooks:  S.choose_split([(pdf, page, i) ...], 0.02, gap=2, block=20)
+    Raises RuntimeError if any page ends up with a neighbour on the other side of the split.
+    """
+    to_val = set()
+    held_docs = {d for d, _, _ in keys if any(h.lower() in d.lower() for h in holdout_docs)}
+    to_val.update(idx for doc, _, idx in keys if doc in held_docs)
+
+    clusters = build_clusters([k for k in keys if k[0] not in held_docs], gap, block)
+    rng = random.Random(seed)
+    rng.shuffle(clusters)
+    target = val_frac * len(keys)
+    for doc, items in clusters:
+        if len(to_val) >= target:
+            break
+        # skip clusters that would overshoot the target by a lot
+        if len(to_val) + len(items) <= target * 1.25 or not to_val:
+            to_val.update(idx for _, idx in items)
+
+    pos = {idx: (d, p) for d, p, idx in keys}
+    val_pages = {pos[i] for i in to_val}
+    buffer = {idx for d, p, idx in keys
+              if idx not in to_val and any((d, p + k) in val_pages or (d, p - k) in val_pages
+                                           for k in range(1, gap + 1))}
+    side = {(d, p): ("val" if idx in to_val else "buffer" if idx in buffer else "train") for d, p, idx in keys}
+    leaks = [((d, p), (d, p + k)) for (d, p), v in side.items() for k in range(1, gap + 1)
+             if (d, p + k) in side and {v, side[(d, p + k)]} == {"train", "val"}]
+    if leaks:
+        raise RuntimeError(f"LEAK: {len(leaks)} neighbouring page pairs straddle the split, e.g. {leaks[:3]}")
+    info = {"clusters_total": len(clusters), "held_out_documents": sorted(held_docs),
+            "documents_total": len({d for d, _, _ in keys}), "neighbour_leaks_across_splits": 0,
+            "val_rows": len(to_val), "buffer_rows": len(buffer),
+            "train_rows": len(keys) - len(to_val) - len(buffer)}
+    return to_val, buffer, info
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
@@ -146,28 +186,8 @@ def main():
             rows.append(row)
     print(f"read {len(rows)} rows ({skipped} skipped: unparseable or no document/page)")
 
-    to_val = set()
-    held_docs = {d for d, _, _ in keys if any(h.lower() in d.lower() for h in args.holdout_docs)}
-    for doc, _, idx in keys:
-        if doc in held_docs:
-            to_val.add(idx)
-
-    clusters = build_clusters([k for k in keys if k[0] not in held_docs], args.gap, args.block)
-    rng = random.Random(args.seed)
-    rng.shuffle(clusters)
-    target = args.val_frac * len(rows)
-    for doc, items in clusters:
-        if len(to_val) >= target:
-            break
-        # prefer clusters that do not overshoot the target by a lot
-        if len(to_val) + len(items) <= target * 1.25 or not to_val:
-            to_val.update(idx for _, idx in items)
-
-    # buffer: training pages within --gap pages of a validation page are not used for training
-    val_pages = {(keys[i][0], keys[i][1]) for i in to_val}
-    buffer = {i for i, (d, p, _) in enumerate(keys)
-              if i not in to_val and any((d, p + k) in val_pages or (d, p - k) in val_pages
-                                         for k in range(1, args.gap + 1))}
+    to_val, buffer, info = choose_split(keys, args.val_frac, args.gap, args.block, args.seed, args.holdout_docs)
+    held_docs = set(info["held_out_documents"])
 
     ext = ".jsonl.gz" if args.gz else ".jsonl"
     os.makedirs(args.out, exist_ok=True)
@@ -184,11 +204,6 @@ def main():
             else:
                 ftr.write(line); n_tr += 1
 
-    # ---- verification: no document/page-neighbour pair across splits (within --gap)
-    side = {(d, p): ("val" if i in to_val else "buffer" if i in buffer else "train") for d, p, i in keys}
-    leaks = [((d, p), (d, p + k)) for (d, p), v in side.items() for k in range(1, args.gap + 1)
-             if (d, p + k) in side and {v, side[(d, p + k)]} == {"train", "val"}]
-
     def split_stats(name, idxs):
         ents, rels = [], []
         for i in idxs:
@@ -204,15 +219,13 @@ def main():
 
     tr_idx = [i for i in range(len(rows)) if i not in to_val and i not in buffer]
     report = {"args": vars(args), "train": split_stats("train", tr_idx), "val": split_stats("val", sorted(to_val)),
-              "buffer_rows_not_used_for_training": len(buffer), "clusters_total": len(clusters), "held_out_documents": sorted(held_docs),
-              "neighbour_leaks_across_splits": len(leaks)}
+              "buffer_rows_not_used_for_training": len(buffer), "clusters_total": info["clusters_total"], "held_out_documents": sorted(held_docs),
+              "neighbour_leaks_across_splits": info["neighbour_leaks_across_splits"]}
     with open(os.path.join(args.out, "split_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"\nwrote {n_tr} train / {n_va} val rows ({100 * n_va / max(len(rows), 1):.1f}%) and set aside "
           f"{n_buf} buffer rows to {args.out}")
-    if leaks:
-        raise SystemExit(f"LEAK: {len(leaks)} neighbouring page pairs straddle the split, e.g. {leaks[:3]}")
     print("check passed: no page has a neighbour (within --gap) on the other side of the split")
 
 
